@@ -53,6 +53,12 @@
         "default": "auto"
       },
       {
+        "name": "system_prompt",
+        "type": "string",
+        "description": "Context appended to the built-in system prompt after a space: ASR 'Perform ASR in <language>.' (or the whole system turn with chat=true), TTS 'Perform TTS in <language> using a <gender> voice.', S2S 'Respond with interleaved text and audio.' (after a --text/text replacement). The combined prompt plus max_tokens must fit the 8192-step limit; <|audio|> and <|audio_out|> are rejected. Short, task-shaped context works best; long personas, contradictory constraints and unsupported controls are accepted but usually hurt quality.",
+        "required": false
+      },
+      {
         "name": "max_tokens",
         "type": "int",
         "min": 1,

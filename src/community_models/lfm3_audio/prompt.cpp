@@ -1,5 +1,6 @@
 #include "engine/community_models/lfm3_audio/prompt.h"
 
+#include "engine/framework/io/text.h"
 #include "engine/framework/runtime/errors.h"
 
 #include <algorithm>
@@ -79,12 +80,30 @@ Lfm3Prompt with_audio(const Lfm3Tokenizer & tokenizer, const std::string & prefi
 
     Lfm3Prompt out;
     out.ids = tokenizer.encode(prefix);
+    require_lfm3_no_audio_placeholders(out.ids, tokenizer.ids());  // a request's system prompt can reach here
+    const auto suffix_ids = tokenizer.encode(suffix);
+    require_lfm3_no_audio_placeholders(suffix_ids, tokenizer.ids());
     out.ids.insert(out.ids.end(), static_cast<size_t>(audio_tokens), tokenizer.ids().audio);
-    append(out.ids, tokenizer.encode(suffix));
+    append(out.ids, suffix_ids);
     return out;
 }
 
 }  // namespace
+
+std::string append_lfm3_system_prompt(const std::string & built_in, const std::string & context) {
+    if (context.size() > kLfm3MaxSystemPromptBytes) {
+        throw runtime::InvalidRequestError("LFM3-Audio system_prompt is " + std::to_string(static_cast<uint64_t>(context.size())) +
+                                           " bytes; it takes at most " +
+                                           std::to_string(static_cast<uint64_t>(kLfm3MaxSystemPromptBytes)));
+    }
+
+    const std::string extra = engine::io::trim_ascii_whitespace(context);
+    if (extra.empty()) {
+        return built_in;
+    }
+
+    return built_in.empty() ? extra : built_in + " " + extra;
+}
 
 const std::vector<Lfm3Voice> & lfm3_tts_voices() {
     static const std::vector<Lfm3Voice> voices = [] {
@@ -135,8 +154,9 @@ Lfm3Prompt make_lfm3_asr_prompt(const Lfm3Tokenizer & tokenizer, const std::stri
                       "<|im_end|>\n<|im_start|>assistant\n");
 }
 
-Lfm3Prompt make_lfm3_chat_prompt(const Lfm3Tokenizer & tokenizer, int64_t audio_tokens, bool thinking) {
-    return with_audio(tokenizer, "<|startoftext|><|im_start|>user\n", audio_tokens,
+Lfm3Prompt make_lfm3_chat_prompt(const Lfm3Tokenizer & tokenizer, int64_t audio_tokens, bool thinking,
+                                 const std::string & system_prompt) {
+    return with_audio(tokenizer, "<|startoftext|>" + system_block(system_prompt) + "<|im_start|>user\n", audio_tokens,
                       std::string("<|im_end|>\n<|im_start|>assistant\n") + (thinking ? "<think>" : "<think></think>"));
 }
 

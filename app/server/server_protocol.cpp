@@ -84,6 +84,7 @@ build_speech_request(const Value &body, const SpeechRequestContext &context) {
                        "guidance_scale");
   add_option_from_json(request.options, body, "num_inference_steps",
                        "num_inference_steps");
+  add_option_from_json(request.options, body, "system_prompt", "system_prompt");
   const auto *instruct = body.find("instruct");
   const auto *instructions = body.find("instructions");
   if (instruct != nullptr && instructions != nullptr) {

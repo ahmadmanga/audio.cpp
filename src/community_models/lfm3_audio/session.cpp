@@ -125,6 +125,16 @@ void require_one_pass(int64_t frames, int sample_rate, double limit, const std::
     }
 }
 
+// The prompt and the generation share the checkpoint's 8192-step conversation. Checked before prefill so a
+// long system_prompt is a client error, not a partial run or a backend failure.
+void require_prompt_room(int64_t prompt_steps, int64_t max_steps, const std::string & remedy) {
+    if (prompt_steps > kLfm3MaxConversationSteps || max_steps > kLfm3MaxConversationSteps - prompt_steps) {
+        throw runtime::CapacityError("LFM3-Audio request needs " + std::to_string(prompt_steps) + " prompt steps plus max_tokens=" +
+                                     std::to_string(max_steps) + ", more than the " + std::to_string(kLfm3MaxConversationSteps) +
+                                     " a request may take; " + remedy);
+    }
+}
+
 runtime::SessionOptions validate_session_setup(const runtime::TaskSpec & task, runtime::SessionOptions options,
                                                const engine::model_spec::ModelContract & contract, runtime::VoiceTaskKind kind) {
     if (task.task != kind) {
@@ -486,8 +496,12 @@ struct Lfm3AsrSession::Impl {
         }
 
         const auto language = runtime::find_option(request.options, {"language"}).value_or("auto");
-        // The ASR system prompt is required: without one the model answers instead of transcribing.
-        out.system_prompt = lfm3_asr_system_prompt(language);
+        const auto context = runtime::find_option(request.options, {"system_prompt"}).value_or("");
+        // ASR needs a system turn to know it should transcribe; a chat answer has no built-in one, so the
+        // request context is its whole system prompt (and language has no effect).
+        out.system_prompt = append_lfm3_system_prompt(out.chat ? std::string() : lfm3_asr_system_prompt(language), context);
+        // Turn away an audio placeholder now, before the audio is encoded.
+        require_lfm3_no_audio_placeholders(model.tokenizer.encode(out.system_prompt), model.tokenizer.ids());
         // The chat prompt has no system turn to name a language in, so a chat answer reports none.
         out.language = language == "auto" || out.chat ? "" : language;
         // An empty value (the CLI or a cleared form field) keeps the default, like the TTS and S2S paths.
@@ -555,9 +569,12 @@ struct Lfm3AsrSession::Impl {
 
     std::string transcribe(const std::vector<float> & samples, const runtime::TimeSpan & span, const RequestOptions & options) {
         const std::vector<float> chunk(samples.begin() + span.start_sample, samples.begin() + span.end_sample);
-        const auto audio = model.encode(chunk);
-        auto prompt = options.chat ? make_lfm3_chat_prompt(model.tokenizer, audio.tokens, options.thinking)
-                                   : make_lfm3_asr_prompt(model.tokenizer, options.system_prompt, audio.tokens);
+        // The encoder's token count follows from the 16 kHz mono length, so the prompt (and its context check)
+        // is built before the chunk is encoded.
+        const auto audio_tokens = lfm3_audio_tokens(lfm3_feature_frames(static_cast<int64_t>(chunk.size())));
+        auto prompt = options.chat
+                          ? make_lfm3_chat_prompt(model.tokenizer, audio_tokens, options.thinking, options.system_prompt)
+                          : make_lfm3_asr_prompt(model.tokenizer, options.system_prompt, audio_tokens);
 
         const auto & ids = model.tokenizer.ids();
         const double seconds = static_cast<double>(chunk.size()) / kSampleRate;
@@ -565,6 +582,14 @@ struct Lfm3AsrSession::Impl {
         // The default stops at the context's end: a 418 s pass (5244 prompt steps) would otherwise ask for 3345 more.
         const auto room = std::max<int64_t>(1, kLfm3MaxConversationSteps - static_cast<int64_t>(prompt.ids.size()));
         generation.max_steps = options.max_tokens.value_or(std::min(lfm3_asr_default_max_tokens(seconds, options.chat, options.thinking), room));
+        require_prompt_room(static_cast<int64_t>(prompt.ids.size()), generation.max_steps,
+                            "shorten system_prompt, the audio chunk, or max_tokens");
+
+        const auto audio = model.encode(chunk);
+        if (audio.tokens != audio_tokens) {
+            throw std::runtime_error("LFM3-Audio encoded a chunk into " + std::to_string(audio.tokens) + " tokens, and its prompt has " +
+                                     std::to_string(audio_tokens) + " slots for it");
+        }
         generation.text = options.text;
         generation.seed = options.seed;
         // Text only: the mode markers would open audio this session cannot make.
@@ -708,7 +733,8 @@ struct Lfm3TtsSession::Impl {
 
         const auto & voice = lfm3_tts_voice(voice_id, language);
         RequestOptions out;
-        out.system_prompt = lfm3_tts_system_prompt(voice);
+        out.system_prompt = append_lfm3_system_prompt(lfm3_tts_system_prompt(voice),
+                                                      runtime::find_option(request.options, {"system_prompt"}).value_or(""));
         out.generation.max_steps = runtime::parse_positive_i64_option(request.options, {"max_tokens"}, kDefaultMaxFrames);
         out.generation.audio = parse_audio_sampling(request, model.assets->generation.speech);
         out.generation.seed = parse_seed(request);
@@ -721,8 +747,10 @@ struct Lfm3TtsSession::Impl {
         const auto chunk_mode = text::parse_text_chunk_mode_override(request.options).value_or(cjk ? text::TextChunkMode::Japanese : text::TextChunkMode::Default);
         for (const auto & chunk : runtime::chunk_text_request(request, chunk_size, chunk_mode)) {
             out.texts.push_back(chunk.text_input->text);
-            // Turn away a placeholder in any chunk now, not after the earlier chunks' audio.
-            (void)make_lfm3_tts_prompt(model.tokenizer, out.system_prompt, out.texts.back());
+            // Turn away a placeholder or a prompt that leaves no room now, not after the earlier chunks' audio.
+            const auto prompt = make_lfm3_tts_prompt(model.tokenizer, out.system_prompt, out.texts.back());
+            require_prompt_room(static_cast<int64_t>(prompt.ids.size()), out.generation.max_steps,
+                                "shorten system_prompt, the text chunk, or max_tokens");
         }
 
         return out;
@@ -930,9 +958,13 @@ struct Lfm3ChatSession::Impl {
         out.system_prompt = kLfm3S2sSystemPrompt;
         if (request.text_input.has_value() && !io::trim_ascii_whitespace(request.text_input->text).empty()) {
             out.system_prompt = request.text_input->text;
-            // Here, so that a stream turns it away before its audio comes; the prompt builder checks again.
-            require_lfm3_no_audio_placeholders(model.tokenizer.encode(out.system_prompt), model.tokenizer.ids());
         }
+        out.system_prompt = append_lfm3_system_prompt(out.system_prompt,
+                                                      runtime::find_option(request.options, {"system_prompt"}).value_or(""));
+        // Here, so that a stream turns it away before its audio comes; the prompt builder checks again.
+        const auto system_ids = model.tokenizer.encode(out.system_prompt);
+        require_lfm3_no_audio_placeholders(system_ids, model.tokenizer.ids());
+        require_lfm3_conversation_room(static_cast<int64_t>(system_ids.size()), 1);
 
         auto & generation = out.generation;
         generation.max_steps = runtime::parse_positive_i64_option(request.options, {"max_tokens"}, kDefaultReplySteps);

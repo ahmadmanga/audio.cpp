@@ -144,6 +144,7 @@ void print_task_list_help() {
         << "    --input-rate <hz>  Raw PCM sample rate for --audio -, default 16000\n"
         << "    --input-channels <n>  Raw PCM channel count for --audio -, default 1\n"
         << "    --text <text>\n"
+        << "    --system-prompt <text>  Context appended to a model's built-in system prompt (LFM3-Audio)\n"
         << "    --max-text-length <chars>  Maximum input text length for models that enforce it\n"
         << "    --language <code>\n"
         << "    --voice-id <id>\n"

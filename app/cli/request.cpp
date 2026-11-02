@@ -601,6 +601,7 @@ engine::runtime::TaskRequest build_request_from_cli(int argc, char ** argv) {
     if (const auto instruct = find_arg(argc, argv, "--instruct")) {
         set_option(request.options, "instruct", *instruct);
     }
+    set_option_from_arg(argc, argv, "--system-prompt", "system_prompt", request.options);
     return request;
 }
 

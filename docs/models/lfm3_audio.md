@@ -44,8 +44,8 @@ safetensors directory.
   streaming decoder in chunks of up to 128 frames.
 - ASR: the prompt is `Perform ASR in <language>.` (`Perform ASR.` with
   `language=auto`) and the audio as the user turn, decoded greedily. With
-  `chat=true` the system turn is left out and the model answers the spoken
-  input as text.
+  `chat=true` the built-in system turn is left out (unless `system_prompt`
+  supplies one) and the model answers the spoken input as text.
 - TTS: the prompt is `Perform TTS in <language> using a <female|male> voice.`
   and the text as the user turn. Each step after `<|audio_start|>` gives one
   80 ms frame until a frame holds the end-of-audio code.
@@ -135,7 +135,8 @@ that reaches it is cut off there and a warning goes to stderr.
 
 `chat=true` answers the spoken input instead of transcribing it, in one pass
 (no chunking); `language` has no effect on the answer, and the result names no
-language. `enable_thinking=true` (needs `chat=true`) lets the model think
+language. `system_prompt` supplies an optional system turn for the answer.
+`enable_thinking=true` (needs `chat=true`) lets the model think
 first and returns only the text after `</think>`. If thinking reaches
 `max_tokens` (512 for chat, 2048 with thinking), or the model ends its turn,
 without closing `</think>`, the answer is empty, as upstream, and a warning says
@@ -174,7 +175,8 @@ arithmetic of graphs of other sizes ([Validation](#validation)).
 
 S2S answers a spoken question with a spoken reply and its text: the CLI prints
 the text and `--text-out` writes it. `--text` replaces the system prompt, which
-the checkpoint was trained with, so leave it out unless experimenting. S2S takes
+the checkpoint was trained with, so leave it out unless experimenting;
+`system_prompt` adds context to the default prompt (or after `--text`). S2S takes
 no voice and no language other than `auto`. The reply may run to `max_tokens`
 (1024) steps, text tokens and frames together. After the reply's text ends, at
 most `max_audio_tail_frames` frames (375, 30 s; 0 for no cap) are sampled before
@@ -246,13 +248,79 @@ route does not forward `max_audio_tail_frames`,
 after encoding the whole question, the prompt, the first text block and the
 first frame.
 
+### System prompt context
+
+`system_prompt` (CLI `--system-prompt`, API `options.system_prompt`) appends
+context to the built-in system prompt after a space. Its outer whitespace is
+trimmed, and an empty or whitespace-only value leaves the built-in unchanged.
+It does not replace the language or voice instruction:
+
+- ASR: `Perform ASR in English.` becomes `Perform ASR in English. <context>`.
+  With `chat=true` there is no built-in system turn, so the context is the
+  whole system prompt.
+- TTS: `Perform TTS in American English using a female voice. <context>`.
+- S2S: `Respond with interleaved text and audio. <context>`. `--text` still
+  replaces the built-in prompt; the context is appended after it.
+
+```bash
+audiocpp_cli --task tts --family lfm3_audio \
+  --model models/LFM3-Audio-2B-GGUF/LFM3-Audio-2B-Q8_0.gguf --backend metal \
+  --text "The next train leaves in ten minutes." --voice-id british_english_male \
+  --system-prompt "Speak slowly and warmly, like a late-night radio host."
+```
+
+The server takes the same option. `/v1/audio/speech` also accepts it as a
+top-level `system_prompt`; the JSON `/v1/audio/transcriptions`,
+`/v1/tasks/run` and `/v1/tasks/stream` take `options.system_prompt`, and the
+live route takes a `system_prompt` query parameter.
+
+```json
+{"model": "lfm3-tts", "input": "The next train leaves in ten minutes.",
+ "voice": "british_english_male",
+ "system_prompt": "Speak slowly and warmly."}
+```
+
+```json
+{"model": "lfm3-asr", "request": {"audio": "/path/to/speech.wav",
+ "options": {"system_prompt": "The speaker is a doctor; keep medical terms exact."}}}
+```
+
+The context is one more part of the prompt: it shares the 8192-step
+conversation with the input and output. A context that leaves no room for
+`max_tokens` fails with `CapacityError` before any audio is encoded or
+generated. Contexts over 64 KiB are rejected before tokenization, and
+`<|audio|>`/`<|audio_out|>` are rejected because only audio or a reply frame
+can fill those slots.
+
+LFM3-Audio is a small task model, not a general instruction follower. Its
+built-in prompts are short and task-shaped, and context in the same style works
+best:
+
+- Effective: one or two short sentences that refine the existing task, such as
+  speaking rate, emotion, formality, punctuation or casing for a transcript,
+  domain vocabulary, or a brief scene. Examples: `Speak slowly and warmly.`,
+  `The speaker is a doctor; keep medical terms exact.`, `Answer in short
+  sentences.`
+- Usually detrimental: long personas or multi-paragraph role-play,
+  chain-of-thought instructions, many constraints that compete with the
+  built-in task, instructions that contradict the built-in language or voice
+  (for example a `german_male` voice asked for a French accent), and requests
+  for controls the model does not have (exact duration, singing, music, sound
+  effects, timestamps, diarization, voice cloning). Chat markup such as
+  `<|im_start|>` or `<|im_end|>` can cut the system turn short.
+
+These are warnings, not restrictions: any context that fits the context limit
+and holds no audio placeholder is passed through, so a detrimental prompt can
+still be tried.
+
 ### WebUI
 
 The WebUI lists LFM3-Audio under ASR, TTS and speech-to-speech, each entry
 reading `models/LFM3-Audio-2B-GGUF/LFM3-Audio-2B-Q8_0.gguf` from the
 `lfm3_audio_2b_q8_0` package, which the WebUI can download. ASR has the `chat`
 and `enable_thinking` options, TTS offers the 38 voices, and speech-to-speech
-has no text box or language, so replies use the default system prompt.
+has no text box or language, so replies use the default system prompt. The
+WebUI does not expose `system_prompt`; use the CLI or API for context.
 
 The speech-to-speech page holds a conversation: each Run sends the recorded or
 chosen question to `/v1/tasks/stream` with the earlier turns, as
@@ -320,6 +388,7 @@ later turns take longer.
 | Option | Task | Default | Meaning |
 |---|---|---|---|
 | `language` | all | `auto` | ASR: the spoken language, or `auto`. TTS: picks that language's female voice when no voice is given. S2S: only `auto`. |
+| `system_prompt` | all | empty | Context appended to the built-in system prompt after a space. ASR: the transcription prompt, or the whole system turn with `chat=true`. TTS: the voice prompt. S2S: the default prompt, or after `--text` when that replaces it. Shares the 8192-step limit with the input and output; see [System prompt context](#system-prompt-context). |
 | `max_tokens` | all | ASR: max(512, 8 per second); chat 512, 2048 with thinking. TTS: 512. S2S: 1024 | ASR: text tokens per chunk. TTS: 80 ms frames per text chunk. S2S: text tokens and frames of the reply together. |
 | `audio_chunk_mode` | ASR | `auto` | `auto`, `fixed`, `vad` or `none`. |
 | `audio_chunk_duration_sec` | ASR | `300` | Longest chunk in seconds, at least 1; never above `lfm3_audio.max_pass_duration_sec`. |
@@ -532,11 +601,12 @@ prefills the whole conversation again.
   backbone's kernel width 7 in ggml-cuda: passes over several steps (prefill,
   the encoder, the codec) run them as shifted row views, and a decode step as
   one multiply and a row sum. The CPU and Metal use `ssm_conv`.
-- ASR takes no request text: `--text` is ignored, so the model card's uses that
-  pair the audio with a typed instruction (translation, questions about the
-  audio, tool calls) are not available.
-- A request's prompt and output share at most 8192 steps, audio.cpp's limit, a
-  quarter of the model card's 32K-token context.
+- ASR still ignores `--text`; use `system_prompt` to add a typed instruction.
+  The model card's uses that pair audio with an instruction (translation,
+  questions about the audio, tool calls) are not part of the validated paths,
+  and LFM3-Audio may follow them unreliably.
+- A request's prompt (including `system_prompt`) and output share at most 8192
+  steps, audio.cpp's limit, a quarter of the model card's 32K-token context.
 - The 4-bit backbones lose accuracy: the 418 s prompt's logits are 0.40-0.42
   rel off with Q4_K_M and 0.62-0.78 with Q4_0 (0.009 with Q8_0), and the short
   clip's transcript differs ("Hallway English Council" for "Whole Life English

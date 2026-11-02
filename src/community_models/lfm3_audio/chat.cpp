@@ -190,7 +190,7 @@ void require_room(int64_t prompt_steps, bool at_least, int64_t max_tokens) {
         throw runtime::CapacityError("LFM3-Audio conversation needs " + std::string(at_least ? "at least " : "") + std::to_string(prompt_steps) +
                                      " prompt steps plus max_tokens=" + std::to_string(max_tokens) + ", more than the " +
                                      std::to_string(kLfm3MaxConversationSteps) +
-                                     " a conversation may take; leave out its oldest turns, or lower max_tokens");
+                                     " a conversation may take; shorten system_prompt, leave out its oldest turns, or lower max_tokens");
     }
 }
 
